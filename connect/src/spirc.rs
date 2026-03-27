@@ -657,6 +657,11 @@ impl SpircTask {
                     rx.close()
                 }
             }
+            SpircCommand::SetPositionOffset(offset) => {
+                info!("Position offset set to {}ms", offset);
+                self.position_offset_ms = offset;
+                return Ok(());
+            }
             SpircCommand::Transfer(request) if !self.connect_state.is_active() => {
                 let device_id = self.session.device_id();
                 self.session
@@ -695,10 +700,6 @@ impl SpircTask {
             SpircCommand::SetPosition(position) => self.handle_seek(position),
             SpircCommand::SetVolume(volume) => self.set_volume(volume),
             SpircCommand::Load(command) => self.handle_load(command, None, None).await?,
-            SpircCommand::SetPositionOffset(offset) => {
-                info!("Position offset set to {}ms", offset);
-                self.position_offset_ms = offset;
-            }
         };
 
         self.notify().await
