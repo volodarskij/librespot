@@ -502,10 +502,17 @@ impl ConnectState {
             let player = self.player_mut();
             let original = player.position_as_of_timestamp;
             player.position_as_of_timestamp = (original - offset).max(0);
+            info!(
+                "send_state: position {} -> {} (offset {})",
+                original,
+                original - offset,
+                offset
+            );
             let result = session.spclient().put_connect_state_request(&self.request).await;
             self.player_mut().position_as_of_timestamp = original;
             result
         } else {
+            info!("send_state: position {} (no offset)", self.player().position_as_of_timestamp);
             session.spclient().put_connect_state_request(&self.request).await
         }
     }
