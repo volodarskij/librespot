@@ -1520,20 +1520,15 @@ impl SpircTask {
     }
 
     fn handle_seek(&mut self, position_ms: u32) {
-        // When position_offset_ms > 0, the Spotify app displays (real - offset).
-        // A seek from the app sends the displayed position, so we add offset back
-        // to get the real decoder position.
-        let real_position = position_ms.saturating_add(self.position_offset_ms);
         let duration = self.connect_state.player().duration;
-        let real_position = if i64::from(real_position) > duration {
-            duration as u32
-        } else {
-            real_position
-        };
+        if i64::from(position_ms) > duration {
+            warn!("tried to seek to {position_ms}ms of {duration}ms");
+            return;
+        }
 
         self.connect_state
-            .update_position(real_position, self.now_ms());
-        self.player.seek(real_position);
+            .update_position(position_ms, self.now_ms());
+        self.player.seek(position_ms);
         let now = self.now_ms();
         match self.play_status {
             SpircPlayStatus::Stopped => (),
@@ -1546,11 +1541,11 @@ impl SpircTask {
             | SpircPlayStatus::Paused {
                 position_ms: ref mut position,
                 ..
-            } => *position = real_position,
+            } => *position = position_ms,
             SpircPlayStatus::Playing {
                 ref mut nominal_start_time,
                 ..
-            } => *nominal_start_time = now - real_position as i64,
+            } => *nominal_start_time = now - position_ms as i64,
         };
     }
 
