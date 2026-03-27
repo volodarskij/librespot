@@ -109,9 +109,6 @@ struct SpircTask {
     update_state: bool,
 
     spirc_id: usize,
-
-    /// offset (ms) subtracted from reported position to compensate for output buffer delay
-    position_offset_ms: u32,
 }
 
 static SPIRC_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -259,7 +256,6 @@ impl Spirc {
             update_state: false,
 
             spirc_id,
-            position_offset_ms: 0,
         };
 
         let spirc = Spirc { commands: cmd_tx };
@@ -659,7 +655,7 @@ impl SpircTask {
             }
             SpircCommand::SetPositionOffset(offset) => {
                 info!("Position offset set to {}ms", offset);
-                self.position_offset_ms = offset;
+                self.connect_state.set_position_offset(offset);
                 return Ok(());
             }
             SpircCommand::Transfer(request) if !self.connect_state.is_active() => {
@@ -1818,21 +1814,10 @@ impl SpircTask {
 
         self.connect_state.set_now(self.now_ms() as u64);
 
-        // Temporarily apply position offset for server reporting, then restore.
-        // This makes the Spotify app show (decoder_position - offset) without
-        // affecting internal state used by update_position_in_relation().
-        let offset = self.position_offset_ms as i64;
-        if offset > 0 {
-            let original = self.connect_state.apply_position_offset(offset);
-            let result = self.connect_state.send_state(&self.session).await;
-            self.connect_state.restore_position(original);
-            result.map(|_| ())
-        } else {
-            self.connect_state
-                .send_state(&self.session)
-                .await
-                .map(|_| ())
-        }
+        self.connect_state
+            .send_state(&self.session)
+            .await
+            .map(|_| ())
     }
 
     fn set_volume(&mut self, volume: u16) {

@@ -131,6 +131,10 @@ pub(super) struct ConnectState {
 
     /// The volume adjustment per step when handling individual volume adjustments.
     pub volume_step_size: u16,
+
+    /// Position offset (ms) subtracted from reported position in send_state().
+    /// Compensates for output buffer delay (e.g., network speaker buffering).
+    pub(crate) position_offset_ms: u32,
 }
 
 impl ConnectState {
@@ -489,25 +493,25 @@ impl ConnectState {
             .await
     }
 
-    /// Sends the connect state for the connect session to the remote server
-    pub async fn send_state(&self, session: &Session) -> SpClientResult {
-        session
-            .spclient()
-            .put_connect_state_request(&self.request)
-            .await
+    /// Sends the connect state for the connect session to the remote server.
+    /// If position_offset_ms > 0, temporarily subtracts offset from position
+    /// before sending, then restores original value.
+    pub async fn send_state(&mut self, session: &Session) -> SpClientResult {
+        let offset = self.position_offset_ms as i64;
+        if offset > 0 {
+            let player = self.player_mut();
+            let original = player.position_as_of_timestamp;
+            player.position_as_of_timestamp = (original - offset).max(0);
+            let result = session.spclient().put_connect_state_request(&self.request).await;
+            self.player_mut().position_as_of_timestamp = original;
+            result
+        } else {
+            session.spclient().put_connect_state_request(&self.request).await
+        }
     }
 
-    /// Temporarily subtract offset from reported position.
-    /// Returns original value so caller can restore after sending.
-    pub(crate) fn apply_position_offset(&mut self, offset_ms: i64) -> i64 {
-        let player = self.player_mut();
-        let original = player.position_as_of_timestamp;
-        player.position_as_of_timestamp = (original - offset_ms).max(0);
-        original
-    }
-
-    /// Restore position after offset was temporarily applied for reporting.
-    pub(crate) fn restore_position(&mut self, position: i64) {
-        self.player_mut().position_as_of_timestamp = position;
+    /// Set position offset (ms) to subtract from reported position.
+    pub(crate) fn set_position_offset(&mut self, offset_ms: u32) {
+        self.position_offset_ms = offset_ms;
     }
 }
