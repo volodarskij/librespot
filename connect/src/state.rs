@@ -496,4 +496,18 @@ impl ConnectState {
             .put_connect_state_request(&self.request)
             .await
     }
+
+    /// Temporarily subtract offset from reported position.
+    /// Returns original value so caller can restore after sending.
+    pub(crate) fn apply_position_offset(&mut self, offset_ms: i64) -> i64 {
+        let player = self.player_mut();
+        let original = player.position_as_of_timestamp;
+        player.position_as_of_timestamp = (original - offset_ms).max(0);
+        original
+    }
+
+    /// Restore position after offset was temporarily applied for reporting.
+    pub(crate) fn restore_position(&mut self, position: i64) {
+        self.player_mut().position_as_of_timestamp = position;
+    }
 }

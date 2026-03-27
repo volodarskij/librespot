@@ -109,6 +109,9 @@ struct SpircTask {
     update_state: bool,
 
     spirc_id: usize,
+
+    /// offset (ms) subtracted from reported position to compensate for output buffer delay
+    position_offset_ms: u32,
 }
 
 static SPIRC_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -132,6 +135,7 @@ enum SpircCommand {
     Activate,
     Transfer(Option<TransferRequest>),
     Load(LoadRequest),
+    SetPositionOffset(u32),
 }
 
 const CONTEXT_FETCH_THRESHOLD: usize = 2;
@@ -255,6 +259,7 @@ impl Spirc {
             update_state: false,
 
             spirc_id,
+            position_offset_ms: 0,
         };
 
         let spirc = Spirc { commands: cmd_tx };
@@ -377,6 +382,17 @@ impl Spirc {
     /// the update is ignored.
     pub fn set_position_ms(&self, position_ms: u32) -> Result<(), Error> {
         Ok(self.commands.send(SpircCommand::SetPosition(position_ms))?)
+    }
+
+    /// Set a position offset (ms) to subtract from the reported position.
+    ///
+    /// Compensates for output buffer delay (e.g., network speaker buffering).
+    /// The Spotify app will see `(decoder_position - offset)` without
+    /// actually seeking the audio decoder.
+    pub fn set_position_offset(&self, offset_ms: u32) -> Result<(), Error> {
+        Ok(self
+            .commands
+            .send(SpircCommand::SetPositionOffset(offset_ms))?)
     }
 
     /// Load a new context and replace the current.
@@ -679,6 +695,10 @@ impl SpircTask {
             SpircCommand::SetPosition(position) => self.handle_seek(position),
             SpircCommand::SetVolume(volume) => self.set_volume(volume),
             SpircCommand::Load(command) => self.handle_load(command, None, None).await?,
+            SpircCommand::SetPositionOffset(offset) => {
+                info!("Position offset set to {}ms", offset);
+                self.position_offset_ms = offset;
+            }
         };
 
         self.notify().await
@@ -1499,15 +1519,20 @@ impl SpircTask {
     }
 
     fn handle_seek(&mut self, position_ms: u32) {
+        // When position_offset_ms > 0, the Spotify app displays (real - offset).
+        // A seek from the app sends the displayed position, so we add offset back
+        // to get the real decoder position.
+        let real_position = position_ms.saturating_add(self.position_offset_ms);
         let duration = self.connect_state.player().duration;
-        if i64::from(position_ms) > duration {
-            warn!("tried to seek to {position_ms}ms of {duration}ms");
-            return;
-        }
+        let real_position = if i64::from(real_position) > duration {
+            duration as u32
+        } else {
+            real_position
+        };
 
         self.connect_state
-            .update_position(position_ms, self.now_ms());
-        self.player.seek(position_ms);
+            .update_position(real_position, self.now_ms());
+        self.player.seek(real_position);
         let now = self.now_ms();
         match self.play_status {
             SpircPlayStatus::Stopped => (),
@@ -1520,11 +1545,11 @@ impl SpircTask {
             | SpircPlayStatus::Paused {
                 position_ms: ref mut position,
                 ..
-            } => *position = position_ms,
+            } => *position = real_position,
             SpircPlayStatus::Playing {
                 ref mut nominal_start_time,
                 ..
-            } => *nominal_start_time = now - position_ms as i64,
+            } => *nominal_start_time = now - real_position as i64,
         };
     }
 
@@ -1797,10 +1822,21 @@ impl SpircTask {
 
         self.connect_state.set_now(self.now_ms() as u64);
 
-        self.connect_state
-            .send_state(&self.session)
-            .await
-            .map(|_| ())
+        // Temporarily apply position offset for server reporting, then restore.
+        // This makes the Spotify app show (decoder_position - offset) without
+        // affecting internal state used by update_position_in_relation().
+        let offset = self.position_offset_ms as i64;
+        if offset > 0 {
+            let original = self.connect_state.apply_position_offset(offset);
+            let result = self.connect_state.send_state(&self.session).await;
+            self.connect_state.restore_position(original);
+            result.map(|_| ())
+        } else {
+            self.connect_state
+                .send_state(&self.session)
+                .await
+                .map(|_| ())
+        }
     }
 
     fn set_volume(&mut self, volume: u16) {
