@@ -109,6 +109,14 @@ struct SpircTask {
     update_state: bool,
 
     spirc_id: usize,
+
+    /// delay (ms) before reporting Playing state (keeps LoadingPlay during delay).
+    /// Compensates for output buffer delay on network speakers.
+    play_delay_ms: u32,
+    /// when set to true, transitions from LoadingPlay to Playing after play_delay
+    play_delay_pending: bool,
+    /// saved nominal_start_time for delayed play transition
+    play_delay_nominal: i64,
 }
 
 static SPIRC_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -133,6 +141,7 @@ enum SpircCommand {
     Transfer(Option<TransferRequest>),
     Load(LoadRequest),
     SetPositionOffset(u32),
+    SetPlayDelay(u32),
 }
 
 const CONTEXT_FETCH_THRESHOLD: usize = 2;
@@ -256,6 +265,9 @@ impl Spirc {
             update_state: false,
 
             spirc_id,
+            play_delay_ms: 0,
+            play_delay_pending: false,
+            play_delay_nominal: 0,
         };
 
         let spirc = Spirc { commands: cmd_tx };
@@ -389,6 +401,15 @@ impl Spirc {
         Ok(self
             .commands
             .send(SpircCommand::SetPositionOffset(offset_ms))?)
+    }
+
+    /// Set a delay (ms) before reporting Playing state to Spotify.
+    ///
+    /// Keeps the device in Loading/Buffering state for the specified duration
+    /// after the decoder starts playing. This makes the Spotify app show a
+    /// loading indicator while the network speaker buffers audio.
+    pub fn set_play_delay(&self, delay_ms: u32) -> Result<(), Error> {
+        Ok(self.commands.send(SpircCommand::SetPlayDelay(delay_ms))?)
     }
 
     /// Load a new context and replace the current.
@@ -531,6 +552,15 @@ impl SpircTask {
                         error!("state update: {why}")
                     }
                 },
+                _ = async { sleep(Duration::from_millis(self.play_delay_ms as u64)).await }, if self.play_delay_pending => {
+                    self.play_delay_pending = false;
+                    info!("Play delay elapsed, transitioning to Playing");
+                    self.play_status = SpircPlayStatus::Playing {
+                        nominal_start_time: self.play_delay_nominal,
+                        preloading_of_next_track_triggered: false,
+                    };
+                    self.update_state = true;
+                },
                 _ = async { sleep(VOLUME_UPDATE_DELAY).await }, if self.update_volume => {
                     self.update_volume = false;
 
@@ -658,6 +688,11 @@ impl SpircTask {
                 self.connect_state.set_position_offset(offset);
                 return Ok(());
             }
+            SpircCommand::SetPlayDelay(delay) => {
+                info!("Play delay set to {}ms", delay);
+                self.play_delay_ms = delay;
+                return Ok(());
+            }
             SpircCommand::Transfer(request) if !self.connect_state.is_active() => {
                 let device_id = self.session.device_id();
                 self.session
@@ -775,12 +810,23 @@ impl SpircTask {
                         }
                     }
                     SpircPlayStatus::LoadingPlay { .. } | SpircPlayStatus::LoadingPause { .. } => {
-                        self.connect_state
-                            .update_position(position_ms, self.now_ms());
-                        self.play_status = SpircPlayStatus::Playing {
-                            nominal_start_time: new_nominal_start_time,
-                            preloading_of_next_track_triggered: false,
-                        };
+                        if self.play_delay_ms > 0 {
+                            // Delay transition to Playing — keep Loading state
+                            // so Spotify app shows buffering indicator
+                            info!("Delaying Playing state by {}ms", self.play_delay_ms);
+                            self.play_delay_pending = true;
+                            self.play_delay_nominal = new_nominal_start_time;
+                            self.connect_state
+                                .update_position(position_ms, self.now_ms());
+                            // Don't change play_status — stays LoadingPlay
+                        } else {
+                            self.connect_state
+                                .update_position(position_ms, self.now_ms());
+                            self.play_status = SpircPlayStatus::Playing {
+                                nominal_start_time: new_nominal_start_time,
+                                preloading_of_next_track_triggered: false,
+                            };
+                        }
                     }
                     _ => return Ok(()),
                 }
@@ -1493,6 +1539,7 @@ impl SpircTask {
     }
 
     fn handle_pause(&mut self) {
+        self.play_delay_pending = false;
         match self.play_status {
             SpircPlayStatus::Playing {
                 nominal_start_time,
@@ -1516,6 +1563,7 @@ impl SpircTask {
     }
 
     fn handle_seek(&mut self, position_ms: u32) {
+        self.play_delay_pending = false;
         let duration = self.connect_state.player().duration;
         if i64::from(position_ms) > duration {
             warn!("tried to seek to {position_ms}ms of {duration}ms");
